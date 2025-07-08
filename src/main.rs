@@ -9,15 +9,18 @@ use client::build_client;
 use config::{config_watcher, load_configs};
 use device::InputDevice;
 use event::Event;
-use nix::libc::ENODEV;
+use nix::libc::{ENODEV, c_int};
 use nix::sys::inotify::{AddWatchFlags, Inotify, InotifyEvent};
 use nix::sys::select::select;
 use nix::sys::select::FdSet;
 use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags};
+use nix::sys::signal::{self, SigHandler, Signal};
 use std::collections::HashMap;
 use std::io::stdout;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 mod action;
@@ -137,8 +140,22 @@ fn main() -> anyhow::Result<()> {
         };
     let mut dispatcher = ActionDispatcher::new(output_device);
 
+    // Set up signal handling for cleanup
+    if let Ok(mut symlink_path) = SYMLINK_PATH.lock() {
+        *symlink_path = _symlink_path.clone();
+    }
+    
+    // Set up signal handlers
+    unsafe {
+        signal::signal(Signal::SIGINT, SigHandler::Handler(handle_signal)).unwrap();
+        signal::signal(Signal::SIGTERM, SigHandler::Handler(handle_signal)).unwrap();
+    }
+
     // Main loop
     loop {
+        if !RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
         match 'event_loop: loop {
             let readable_fds = select_readable(input_devices.values(), &watchers, timer_fd)?;
             if readable_fds.contains(timer_fd) {
@@ -198,6 +215,21 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    
+    // Clean up symlink on normal exit
+    cleanup_symlink(&_symlink_path);
+    Ok(())
+}
+
+static RUNNING: AtomicBool = AtomicBool::new(true);
+static SYMLINK_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+extern "C" fn handle_signal(_: c_int) {
+    RUNNING.store(false, Ordering::Relaxed);
+    if let Ok(symlink_path) = SYMLINK_PATH.lock() {
+        cleanup_symlink(&*symlink_path);
+    }
+    std::process::exit(0);
 }
 
 /// Clean up the symlink when the program exits
