@@ -9,7 +9,7 @@ use log::debug;
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fs::{read_dir, create_dir_all};
+use std::fs::{read_dir, create_dir_all, File};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::prelude::AsRawFd;
 use std::os::unix::fs::symlink;
@@ -407,18 +407,38 @@ impl InputDevice {
 
 const SEPARATOR: &str = "------------------------------------------------------------------------------";
 
-/// Find the next available xremap symlink number
-fn find_next_xremap_number() -> anyhow::Result<u32> {
-    let by_id_dir = Path::new("/dev/input/by-id");
+/// Get the directory for symlink creation based on permissions
+fn get_symlink_directory() -> anyhow::Result<PathBuf> {
+    let root_dir = Path::new("/dev/input/by-id");
     
-    if !by_id_dir.exists() {
-        create_dir_all(by_id_dir)?;
+    // Try to create a test file in /dev/input/by-id to check permissions
+    if let Ok(test_file) = File::create(root_dir.join(".xremap_test")) {
+        drop(test_file);
+        let _ = std::fs::remove_file(root_dir.join(".xremap_test"));
+        return Ok(root_dir.to_path_buf());
+    }
+    
+    // Fall back to user runtime directory
+    let uid = unsafe { nix::libc::getuid() };
+    let user_dir = PathBuf::from(format!("/var/run/user/{}", uid));
+    
+    if !user_dir.exists() {
+        create_dir_all(&user_dir)?;
+    }
+    
+    Ok(user_dir)
+}
+
+/// Find the next available xremap symlink number
+fn find_next_xremap_number(symlink_dir: &Path) -> anyhow::Result<u32> {
+    if !symlink_dir.exists() {
+        create_dir_all(symlink_dir)?;
         return Ok(0);
     }
 
     let mut used_numbers = HashSet::new();
     
-    if let Ok(entries) = read_dir(by_id_dir) {
+    if let Ok(entries) = read_dir(symlink_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
@@ -441,8 +461,9 @@ fn find_next_xremap_number() -> anyhow::Result<u32> {
 
 /// Create a numbered symlink for the virtual device
 pub fn create_xremap_symlink(device_path: &Path) -> anyhow::Result<PathBuf> {
-    let number = find_next_xremap_number()?;
-    let symlink_path = PathBuf::from(format!("/dev/input/by-id/xremap{}", number));
+    let symlink_dir = get_symlink_directory()?;
+    let number = find_next_xremap_number(&symlink_dir)?;
+    let symlink_path = symlink_dir.join(format!("xremap{}", number));
     
     // Remove existing symlink if it exists
     if symlink_path.exists() {
